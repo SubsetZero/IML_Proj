@@ -99,82 +99,61 @@ def get_data(**kwargs):
 
 
 def train_model(train_data_input, train_data_label, **kwargs):
-    """
-    Train the model. Fill in the details of the data loader, the loss function,
-    the optimizer, and the training loop.
-
-    Args:
-    - train_data_input: Tensor[N_train_samples, C, H, W]
-    - train_data_label: Tensor[N_train_samples, C, H, W]
-    - kwargs: Additional arguments that you might find useful - not necessary
-
-    Returns:
-    - model: torch.nn.Module
-    """
-    model = Model()
-    model.train()
-    model.to(device)
-
-    # TODO: Dummy criterion - change this to the correct loss function
-    # https://pytorch.org/docs/stable/nn.html#loss-functions
-    criterion = nn.MSELoss()
-    # TODO: Dummy optimizer - change this to a more suitable optimizer
-    optimizer = torch.optim.Adam(model.parameters())
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
-
-    # TODO: Correctly setup the dataloader - the below is just a placeholder
-    # Also consider that you might not want to use the entire dataset for
-    # training alone
-    # (batch_size needs to be changed)
-    batch_size = 64
+    # Build dataset and split
     dataset = TensorDataset(train_data_input, train_data_label)
-    # Consider the shuffle parameter and other parameters of the DataLoader
-    # class (see
-    # https://pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader)
-    train_size = int(0.8 * len(dataset))  # 80% for training
-    val_size = len(dataset) - train_size  # 20% for validation
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    # Training loop
-    # TODO: Modify the training loop in case you need to
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
 
-    # TODO: The value of n_epochs is just a placeholder and likely needs to be
-    # changed
-    n_epochs = 15
+    model = Model().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-6)
+    criterion = nn.MSELoss()
 
-    for epoch in range(n_epochs):
+    best_val = float('inf')
+    patience, wait = 5, 0
+    for epoch in range(1, 101):
         model.train()
         train_loss = 0.0
-        for x, y in tqdm(
-            train_loader, desc=f"Training Epoch {epoch}", leave=False
-        ):
+        for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
-            output = model(x)
-            loss = criterion(output, y)
+            pred = model(x)
+            # Full-image loss
+            loss_full = criterion(pred, y)
+            # Center-region loss
+            s = 10; e = 18
+            loss_center = criterion(pred[..., s:e, s:e], y[..., s:e, s:e])
+            loss = loss_full + 5.0 * loss_center
             loss.backward()
             optimizer.step()
-            train_loss += loss.item() * x.size(0)
-        
+            train_loss += loss_full.item() * x.size(0)
+        train_loss /= len(train_loader.dataset)
+
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for x, y in tqdm(
-                val_loader, desc=f"Validating Epoch {epoch}", leave=False
-            ):
+            for x, y in val_loader:
                 x, y = x.to(device), y.to(device)
-                output = model(x)
-                loss = criterion(output, y)
-                val_loss += loss.item() * x.size(0)
-
-        # Average the losses over the entire dataset
-        train_loss /= len(train_loader.dataset)
+                pred = model(x)
+                val_loss += criterion(pred, y).item() * x.size(0)
         val_loss /= len(val_loader.dataset)
 
-        print(f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Validation Loss: {val_loss:.4f}")
         scheduler.step()
+        print(f"Epoch {epoch} | Train MSE: {train_loss:.4f} | Val MSE: {val_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
+
+        # Early stopping
+        if val_loss < best_val:
+            best_val = val_loss
+            wait = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"Stopping early at epoch {epoch}.")
+                break
 
     return model
 
@@ -187,68 +166,82 @@ class Model(nn.Module):
     """
 
     def __init__(self):
-        """
-        The constructor of the model.
-        """
-        super().__init__()
-        #self.fc = nn.Linear(784, 784)
-        self.encoder = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),     # (1, 28, 28) -> (32, 28, 28)
+        super(Model, self).__init__()
+        # Encoder blocks
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True)
+        )
+        self.pool1 = nn.MaxPool2d(2)  # 28 -> 14
+
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),    # -> (64, 28, 28)
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+        self.pool2 = nn.MaxPool2d(2)  # 14 -> 7
+
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.1),
-            nn.MaxPool2d(2),                                # -> (64, 14, 14)
-            nn.Dropout(0.1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.dropout = nn.Dropout2d(p=0.3)
 
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),   # -> (128, 14, 14)
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.1),
-            nn.MaxPool2d(2),                                # -> (128, 7, 7)
-            nn.Dropout(0.1),
-
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),  # -> (256, 7, 7)
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.1)
+        # Decoder blocks
+        self.up2 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(32 + 32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
         )
 
-        self.decoder = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='nearest'),    # -> (256, 14, 14)
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),  
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.1),
-
-            nn.Upsample(scale_factor=2, mode='nearest'),    # -> (128, 28, 28)
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),   
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.1),
-
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.1),
-
-            nn.Conv2d(32, 1, kernel_size=3, padding=1),      # -> (1, 28, 28)
-            nn.Sigmoid()
+        self.up1 = nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(16 + 16, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True)
         )
+
+        self.final_conv = nn.Conv2d(16, 1, kernel_size=1)
+
 
     def forward(self, x):
-        """
-        The forward pass of the model.
+        # Encoder
+        e1 = self.enc1(x)
+        p1 = self.pool1(e1)
+        e2 = self.enc2(p1)
+        p2 = self.pool2(e2)
+        e3 = self.enc3(p2)
+        d = self.dropout(e3)
 
-        input: x: torch.Tensor, the input to the model
+        # Decoder
+        u2 = self.up2(d)
+        d2 = torch.cat([u2, e2], dim=1)
+        d2 = self.dec2(d2)
+        u1 = self.up1(d2)
+        d1 = torch.cat([u1, e1], dim=1)
+        d1 = self.dec1(d1)
 
-        output: x: torch.Tensor, the output of the model
-        """
-        # Flatten the image in the last two dimensions
-        #x = x.view(x.shape[0], -1)
-        #x = self.fc(x)
-        #x = F.relu(x)
-        # Reshape the image to the original shape
-        #x = x.view(x.shape[0], 1, 28, 28)
-        x = self.encoder(x)
-        x = self.decoder(x)
-        return x
+        out = self.final_conv(d1)
+        out = torch.sigmoid(out)
+        return out
 
 
 def test_model(model, test_data_input):
